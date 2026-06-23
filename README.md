@@ -2,8 +2,36 @@
 
 > A production-grade ML-powered API that predicts the actual packed weight of warehouse shipments, replacing inaccurate theoretical weight calculations with data-driven predictions.
 
-**Status:** Design Phase  
+**Status:** Design Phase (this README) / **Phase 1 implementation in progress** (see below)
 ---
+
+## Current Implementation Status
+
+Everything below this section documents the eventual production-grade design
+(Postgres, Redis, Docker, auth, model registry, drift detection). None of
+that exists yet, and it isn't being built until real data and deployment
+scope are confirmed with the client.
+
+What's actually implemented right now, scoped to Phase 1 of
+[Development Phases](#development-phases):
+
+- `src/shipment_weight/data_gen.py` — synthetic shipment data generator (no real warehouse data received yet)
+- `src/shipment_weight/features.py` — shared feature engineering, used by both the notebook and the API
+- `src/shipment_weight/train.py` — trains linear / ridge / random forest / gradient boosted tree candidates
+- `src/shipment_weight/evaluate.py` — MAE/RMSE/bias metrics, baseline comparison, segment analysis
+- `notebooks/01_eda_and_modeling.ipynb` — EDA, model comparison, evaluation, SHAP feature importance
+- `api/main.py` — a single FastAPI `/v1/predict` endpoint with confidence band, no DB/Redis/Docker/auth
+- `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior
+- `tests/` — unit tests for data generation, feature engineering, and the API
+
+**Quick start:**
+
+```bash
+pip install -r requirements.txt
+PYTHONPATH=src python -m shipment_weight.train --out models/model.joblib
+PYTHONPATH=src uvicorn api.main:app --reload
+pytest tests/
+```
 
 ## Table of Contents
 
