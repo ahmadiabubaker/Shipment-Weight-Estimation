@@ -3,9 +3,6 @@
 > A production-grade ML-powered API that predicts the actual packed weight of warehouse shipments, replacing inaccurate theoretical weight calculations with data-driven predictions.
 
 **Status:** Design Phase  
-**Owner:** Perseuss  
-**First Customer:** Medusa Distribution
-
 ---
 
 ## Table of Contents
