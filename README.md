@@ -36,7 +36,13 @@ The result: carriers bill based on actual weight (or dimensional weight), and th
 
 ### The Solution
 
-Build a supervised ML model trained on historical shipments where both theoretical and actual packed weights are known. Serve predictions through a REST API that integrates into existing warehouse management systems and Perseuss products (cartonization, Dates and Rates).
+Build a supervised ML model trained on historical shipments where both theoretical and actual packed weights are known. The model predicts the **weight adjustment** (actual - theoretical), not the absolute weight. This means:
+
+- The learning problem is easier: the target is a small correction centered near zero instead of a number spanning ounces to pounds.
+- Graceful degradation: if the model predicts zero adjustment, the system returns the theoretical weight exactly — it can never do worse than what warehouses already use.
+- The baseline comparison is structurally honest: a zero-adjustment model IS the baseline.
+
+Serve predictions through a REST API that integrates into existing warehouse management systems and Perseuss products (cartonization, Dates and Rates).
 
 ### Success Metrics
 
@@ -44,7 +50,7 @@ Build a supervised ML model trained on historical shipments where both theoretic
 |---|---|---|
 | Mean Absolute Error (MAE) | Measured during EDA | 30%+ reduction vs baseline |
 | Predictions within +/- 2 oz | Measured during EDA | > 80% of shipments |
-| API latency (p95) | N/A | < 50ms |
+| API latency (p95) | N/A | < 100ms |
 | API availability | N/A | 99.9% |
 
 ---
@@ -96,10 +102,10 @@ Build a supervised ML model trained on historical shipments where both theoretic
 │  ┌────────────┐  ┌─────────┐  ┌──────────────────────────┐ │
 │  │ PostgreSQL │  │  Redis  │  │  Object Storage (S3)     │ │
 │  │            │  │         │  │                          │ │
-│  │ predictions│  │ pred    │  │ model artifacts (.joblib)│ │
-│  │ feedback   │  │ cache   │  │ training datasets        │ │
-│  │ model reg  │  │ rate    │  │ evaluation reports       │ │
-│  │ audit log  │  │ limits  │  │                          │ │
+│  │ predictions│  │ hist.   │  │ model artifacts (.joblib)│ │
+│  │ feedback   │  │ feature │  │ training datasets        │ │
+│  │ model reg  │  │ cache + │  │ evaluation reports       │ │
+│  │ audit log  │  │ rate lim│  │                          │ │
 │  └────────────┘  └─────────┘  └──────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 
@@ -122,9 +128,9 @@ Build a supervised ML model trained on historical shipments where both theoretic
 | **API Layer** | HTTP interface, validation, auth, rate limiting | FastAPI, Pydantic, uvicorn |
 | **Model Service** | Feature engineering, model loading, inference | scikit-learn, LightGBM, joblib |
 | **Data Service** | Persistence, querying, audit trail | SQLAlchemy, Alembic |
-| **Cache** | Prediction dedup, rate limiting | Redis |
+| **Cache** | Historical feature lookup, rate limiting | Redis |
 | **Database** | Predictions, feedback, model registry | PostgreSQL 16 |
-| **Object Storage** | Model artifacts, training data | S3 / MinIO (local dev) |
+| **Object Storage** | Model artifacts, training data | Local filesystem (dev), S3 (production — added when deploying to cloud) |
 | **Training Pipeline** | Offline model training and evaluation | scikit-learn, LightGBM, pandas |
 
 ### Key Design Decisions
@@ -133,8 +139,9 @@ Build a supervised ML model trained on historical shipments where both theoretic
 |---|---|---|
 | **Web framework** | FastAPI | Async, auto OpenAPI docs, Pydantic validation, production-proven |
 | **Model serving** | In-process (loaded at startup) | Prediction is fast (~1ms). No need for TF Serving or Triton. Simplifies deployment. |
+| **Prediction target** | Residual (actual - theoretical) | Model predicts the adjustment, not the absolute weight. Easier learning problem, graceful degradation to baseline on zero prediction. |
 | **Database** | PostgreSQL | Structured data, JSONB for flexible payloads, battle-tested |
-| **Cache** | Redis | Prediction dedup for identical shipments, rate limiting, fast |
+| **Cache** | Redis | Rate limiting and historical feature lookup cache. Not used for prediction dedup — shipment-level requests rarely repeat, and predictions depend on model version and historical features that change over time, making cache invalidation unreliable. |
 | **ML library** | scikit-learn + LightGBM | Simple models first. LightGBM for gradient boosting when needed. |
 | **Multi-tenancy** | `warehouse_id` on every record | Medusa is first customer, but the system should support others without code changes |
 | **Model format** | joblib serialization | Standard for scikit-learn. Model file loaded into memory at startup. |
@@ -214,8 +221,7 @@ Key format: `swe_{environment}_{random}` where environment is `live`, `test`, or
   },
   "model_version": "v2.1.0",
   "metadata": {
-    "latency_ms": 4,
-    "cached": false
+    "latency_ms": 4
   }
 }
 ```
@@ -422,13 +428,13 @@ Returns 200 when the service is ready to accept traffic (model loaded, DB connec
 │ config (JSONB)  │     │ warehouse_id    │     │ actual_weight_oz│
 │ created_at      │     │ request (JSONB) │     │ error_oz        │
 └─────────────────┘     │ features (JSONB)│     │ error_pct       │
-                        │ predicted_wt    │     │ measured_by     │
-                        │ theoretical_wt  │     │ created_at      │
-                        │ confidence_low  │     └─────────────────┘
+                        │ predicted_adj   │     │ measured_by     │
+                        │ predicted_wt    │     │ created_at      │
+                        │ theoretical_wt  │     └─────────────────┘
+                        │ confidence_low  │
                         │ confidence_high │
                         │ model_version   │
                         │ latency_ms      │
-                        │ cached (BOOL)   │
                         │ created_at      │
                         └─────────────────┘
 ```
@@ -465,16 +471,13 @@ CREATE TABLE model_registry (
     feature_config JSONB NOT NULL,         -- ordered feature list + encoding info
     is_active BOOLEAN DEFAULT false,       -- only one active at a time
     trained_on_rows INTEGER NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now(),
-
-    CONSTRAINT one_active_model CHECK (
-        NOT is_active OR id = (
-            SELECT id FROM model_registry
-            WHERE is_active = true
-            ORDER BY created_at DESC LIMIT 1
-        )
-    )
+    created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Enforce at most one active model. Postgres CHECK constraints cannot contain
+-- subqueries, so we use a partial unique index on a constant expression instead.
+CREATE UNIQUE INDEX one_active_model
+    ON model_registry ((true)) WHERE is_active = true;
 
 -- Predictions (append-only, partitioned by month)
 CREATE TABLE predictions (
@@ -483,13 +486,13 @@ CREATE TABLE predictions (
     warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
     request_payload JSONB NOT NULL,       -- full request for reproducibility
     features JSONB NOT NULL,              -- computed feature vector
-    predicted_weight_oz DOUBLE PRECISION NOT NULL,
+    predicted_adjustment_oz DOUBLE PRECISION NOT NULL,  -- model output (residual)
+    predicted_weight_oz DOUBLE PRECISION NOT NULL,     -- theoretical + adjustment
     theoretical_weight_oz DOUBLE PRECISION NOT NULL,
     confidence_low DOUBLE PRECISION,
     confidence_high DOUBLE PRECISION,
     model_version TEXT NOT NULL REFERENCES model_registry(version),
     latency_ms INTEGER NOT NULL,
-    cached BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT now()
 ) PARTITION BY RANGE (created_at);
 
@@ -536,18 +539,31 @@ CREATE INDEX idx_feedback_error
 
 ## ML Pipeline
 
+### Prediction Target: Residual, Not Absolute Weight
+
+The model predicts `adjustment_oz = actual_weight - theoretical_weight`, not the absolute weight.
+
+```
+predicted_weight = theoretical_weight + model.predict(features)
+```
+
+Why this matters:
+- **Easier learning problem.** The target is a small correction centered near zero (typically -5 to +10 oz) instead of a number spanning ounces to many pounds. Models converge faster and generalize better.
+- **Structural baseline guarantee.** If `model.predict(features) == 0`, the system returns theoretical weight exactly. The model can never do worse than what warehouses already use.
+- **Honest evaluation.** The baseline (zero-adjustment model) and the ML model are evaluated on the same target scale, so improvement percentages are meaningful.
+
 ### Training Flow
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  1. Extract  │───►│  2. Feature  │───►│  3. Split    │
-│  Historical  │    │  Engineering │    │  Train/Test  │
-│  Data        │    │              │    │  (time-based)│
+│  1. Extract  │───►│  2. Compute  │───►│  3. Split    │
+│  Historical  │    │  As-of       │    │  Train/Test  │
+│  Data        │    │  Features    │    │  (time-based)│
 └──────────────┘    └──────────────┘    └──────┬───────┘
                                                │
                     ┌──────────────┐    ┌───────▼──────┐
                     │  5. Compare  │◄───│  4. Train    │
-                    │  to Champion │    │  Candidates  │
+                    │  to Champion │    │  on residual │
                     └──────┬───────┘    └──────────────┘
                            │
                     ┌──────▼───────┐    ┌──────────────┐
@@ -556,14 +572,65 @@ CREATE INDEX idx_feedback_error
                     └──────────────┘    └──────────────┘
 ```
 
+### Point-in-Time Feature Construction (Critical)
+
+Historical features (avg SKU weight error, carton type error, warehouse bias) are computed from past feedback. **Every historical feature for a shipment at time T must be built only from feedback with `created_at < T`.** Without this, the model sees future information during training, looks brilliant offline, and collapses in production.
+
+```python
+# WRONG — temporal leakage
+sku_avg_error = feedback_df.groupby("sku")["error_oz"].mean()
+
+# CORRECT — as-of join
+def build_as_of_features(shipments_df, feedback_df):
+    """Build historical features with point-in-time correctness.
+
+    For each shipment at time T, only feedback records with
+    created_at < T are used to compute aggregates.
+    """
+    features = []
+    for _, shipment in shipments_df.iterrows():
+        cutoff = shipment["created_at"]
+
+        # Only feedback that existed BEFORE this shipment
+        prior_feedback = feedback_df[feedback_df["created_at"] < cutoff]
+
+        # SKU-level error history
+        skus = shipment["sku_list"]
+        sku_errors = prior_feedback[prior_feedback["sku"].isin(skus)]
+        avg_sku_error = sku_errors["error_oz"].mean() if len(sku_errors) > 0 else None
+
+        # Carton-type error history
+        carton_errors = prior_feedback[
+            prior_feedback["carton_type"] == shipment["carton_type"]
+        ]
+        avg_carton_error = carton_errors["error_oz"].mean() if len(carton_errors) > 0 else None
+
+        # Warehouse bias
+        wh_errors = prior_feedback[
+            prior_feedback["warehouse_id"] == shipment["warehouse_id"]
+        ]
+        warehouse_bias = wh_errors["error_oz"].mean() if len(wh_errors) > 0 else None
+
+        features.append({
+            "shipment_id": shipment["id"],
+            "avg_sku_weight_error_oz": avg_sku_error,
+            "avg_carton_type_error_oz": avg_carton_error,
+            "warehouse_bias_oz": warehouse_bias,
+        })
+
+    return pd.DataFrame(features)
+```
+
+At inference time, the same logic applies naturally: the model only has access to feedback that has already been received.
+
 ### Model Candidates
 
 Start simple, add complexity only if it helps:
 
 | Model | Library | Why try it |
 |---|---|---|
-| **Theoretical weight (baseline)** | None | This is what warehouses use today. Benchmark everything against this. |
-| **Linear Regression** | scikit-learn | Interpretable, fast, shows feature importance directly. |
+| **Zero adjustment (baseline)** | None | Predicts 0 adjustment for every shipment. This IS the theoretical weight. Benchmark everything against this. |
+| **Linear Regression** | scikit-learn | Interpretable, fast, shows which features drive the adjustment. |
 | **Ridge Regression** | scikit-learn | Handles correlated features better than plain linear. |
 | **Random Forest** | scikit-learn | Handles non-linear relationships, robust to outliers. |
 | **LightGBM** | lightgbm | Best accuracy for tabular data in most cases. Fast training. |
@@ -577,15 +644,18 @@ Start simple, add complexity only if it helps:
 |  Jan 2025 ─── Sep 2025    |  Oct 2025 ─── Dec 2025|
 ```
 
-**Metrics:**
+**Target:** `adjustment_oz = actual_weight_oz - theoretical_weight_oz`
+
+**Metrics (applied to final predicted weight, not the raw residual):**
 
 | Metric | What it measures | Target |
 |---|---|---|
-| MAE (oz) | Average prediction error | Lower is better |
+| MAE (oz) | Average absolute error of predicted weight vs actual | Lower is better |
 | RMSE (oz) | Penalizes large errors more | Lower is better |
 | MAPE (%) | Percentage error, normalizes across weight ranges | < 5% |
 | % within 2 oz | Practical accuracy threshold | > 80% |
 | Bias (oz) | Systematic over/under prediction | Near 0 |
+| Adjustment MAE (oz) | How well the model predicts the residual itself | Lower is better |
 
 **Segment analysis:** Break down metrics by:
 - Carton type (some cartons may be harder to predict)
@@ -613,16 +683,29 @@ Semantic versioning: `v{major}.{minor}.{patch}`
 
 ### Confidence Intervals
 
-Use quantile regression or conformal prediction to provide prediction intervals:
+**Conformal prediction via MAPIE.** Provides a distribution-free coverage guarantee: if you request a 90% interval, at least 90% of actual weights will fall within it, regardless of the model or data distribution. No hand-tuning of quantile models.
 
 ```python
-# For tree-based models: use quantile predictions
-# LightGBM supports quantile regression natively
-# Alternative: conformal prediction wrapper (MAPIE library)
+from mapie.regression import MapieRegressor
 
+# Wrap any scikit-learn-compatible model
+mapie = MapieRegressor(base_model, method="plus", cv=5)
+mapie.fit(X_train, y_train_residual)
+
+# Predict adjustment with 90% prediction interval
+adjustment_pred, adjustment_intervals = mapie.predict(X_new, alpha=0.10)
+
+# Convert back to absolute weight
+predicted_weight = theoretical_weight + adjustment_pred
+confidence_low = theoretical_weight + adjustment_intervals[:, 0]
+confidence_high = theoretical_weight + adjustment_intervals[:, 1]
+```
+
+Response shape:
+```json
 {
   "confidence": {
-    "interval_oz": [51.8, 54.6],  # 90% of actual weights fall here
+    "interval_oz": [51.8, 54.6],
     "level": 0.90
   }
 }
@@ -655,21 +738,51 @@ Use quantile regression or conformal prediction to provide prediction intervals:
 
 ### Historical / Learned Features (require feedback data)
 
-These features use past prediction accuracy. They are unavailable for new SKUs/cartons (cold start — use defaults).
+These features use past feedback to encode how much error a given SKU, carton type, or warehouse typically produces. They are the most predictive features in the catalog, but they come with two constraints:
 
-| # | Feature | Type | Computation |
-|---|---|---|---|
-| 17 | `avg_sku_weight_error_oz` | float | Rolling average weight error for the SKUs in this shipment |
-| 18 | `avg_carton_type_error_oz` | float | Rolling average weight error for this carton type |
-| 19 | `warehouse_bias_oz` | float | Systematic weight bias for this warehouse |
+1. **Point-in-time correctness.** At training time, each shipment's historical features are computed only from feedback with `created_at` before that shipment's timestamp. See the [Point-in-Time Feature Construction](#point-in-time-feature-construction-critical) section in ML Pipeline. At inference time, this happens naturally — only feedback received so far is available.
+
+2. **Cold start.** New SKUs, new carton types, and new warehouses have no history. Impute with the **global mean error** (across all SKUs/cartons/warehouses), not zero. Zero encodes "this entity has historically had zero error" — a confident and wrong prior. Carry an `_is_cold_start` indicator flag so the model can learn to weight these features down when history is absent.
+
+| # | Feature | Type | Computation | Cold Start Default |
+|---|---|---|---|---|
+| 17 | `avg_sku_weight_error_oz` | float | Mean weight error for SKUs in this shipment (as-of) | Global mean error |
+| 18 | `avg_carton_type_error_oz` | float | Mean weight error for this carton type (as-of) | Global mean error |
+| 19 | `warehouse_bias_oz` | float | Mean weight error for this warehouse (as-of) | Global mean error |
+| 20 | `historical_features_cold_start` | bool | True if any of features 17-19 fell back to global mean | N/A |
+
+### Serving-Time Latency for Historical Features
+
+Features 17-19 require database lookups. Under load, three DB round trips per request would blow the p95 latency target. Solution: **precompute historical feature aggregates into a Redis hash, refreshed every 5 minutes by a background task.** These aggregates change slowly (they're rolling averages over thousands of feedback records), so a few minutes of staleness is acceptable.
+
+```
+Background task (every 5 min):
+  SELECT sku, AVG(error_oz) FROM feedback GROUP BY sku → Redis HSET sku_errors
+  SELECT carton_type, AVG(error_oz) FROM feedback GROUP BY carton_type → Redis HSET carton_errors
+  SELECT warehouse_id, AVG(error_oz) FROM feedback GROUP BY warehouse_id → Redis HSET warehouse_biases
+  SELECT AVG(error_oz) FROM feedback → Redis SET global_mean_error
+
+Hot path (per request):
+  Redis HMGET sku_errors sku1 sku2 sku3 → ~0.1ms
+  Redis HGET carton_errors carton_type → ~0.1ms
+  Redis HGET warehouse_biases warehouse_id → ~0.1ms
+```
+
+This keeps the prediction hot path at model inference time (~1ms) + Redis lookups (~0.3ms) + overhead, well within the p95 < 100ms target.
 
 ### Feature Pipeline Design
 
 ```python
-# Pseudocode for the feature engineering pipeline
-
 class FeatureEngineer:
-    """Stateless feature computation from a prediction request."""
+    """Computes features from a prediction request.
+
+    Direct features (1-16) are computed from the request payload.
+    Historical features (17-20) are looked up from a precomputed
+    Redis cache, with global-mean fallback for cold-start entities.
+    """
+
+    def __init__(self, feature_cache: FeatureCache):
+        self._cache = feature_cache  # Redis-backed lookup
 
     def compute(self, request: PredictRequest) -> dict[str, float]:
         features = {}
@@ -704,10 +817,31 @@ class FeatureEngineer:
         # --- Dimensional weight ---
         features["dimensional_weight_oz"] = self._dim_weight(request.carton.dimensions)
 
-        # --- Historical features (from DB, with fallbacks) ---
-        features["avg_sku_weight_error_oz"] = self._lookup_sku_error(request.items)
-        features["avg_carton_type_error_oz"] = self._lookup_carton_error(request.carton.carton_type)
-        features["warehouse_bias_oz"] = self._lookup_warehouse_bias(request.warehouse_id)
+        # --- Historical features (Redis cache, global-mean fallback) ---
+        global_mean = self._cache.get_global_mean_error()
+        cold_start = False
+
+        sku_error = self._cache.get_sku_errors(
+            [item.sku for item in request.items]
+        )
+        if sku_error is None:
+            sku_error = global_mean
+            cold_start = True
+        features["avg_sku_weight_error_oz"] = sku_error
+
+        carton_error = self._cache.get_carton_error(request.carton.carton_type)
+        if carton_error is None:
+            carton_error = global_mean
+            cold_start = True
+        features["avg_carton_type_error_oz"] = carton_error
+
+        wh_bias = self._cache.get_warehouse_bias(request.warehouse_id)
+        if wh_bias is None:
+            wh_bias = global_mean
+            cold_start = True
+        features["warehouse_bias_oz"] = wh_bias
+
+        features["historical_features_cold_start"] = cold_start
 
         return features
 ```
@@ -717,8 +851,9 @@ class FeatureEngineer:
 | Type | Strategy |
 |---|---|
 | Categorical (< 20 values) | One-hot encoding |
-| Categorical (> 20 values) | Target encoding (mean weight error per category) |
-| Missing numerics | Impute with 0 or median, add `_is_missing` indicator |
+| Categorical (> 20 values) | Target encoding (mean residual per category) |
+| Missing numerics | Impute with global mean (not zero), add `_is_missing` indicator |
+| Boolean flags | 0/1 encoding |
 
 ---
 
@@ -803,16 +938,10 @@ shipment-weight-estimation/
 │   ├── docker/
 │   │   ├── Dockerfile              # Multi-stage build
 │   │   ├── Dockerfile.train        # Training-specific image
-│   │   └── docker-compose.yml      # Local: API + Postgres + Redis + MinIO
-│   ├── github/
-│   │   └── workflows/
-│   │       ├── ci.yml              # Lint + test + build on PR
-│   │       ├── deploy.yml          # Build + push + deploy on merge to main
-│   │       └── train.yml           # Weekly retraining pipeline
-│   └── terraform/                  # Cloud infra (Phase 3)
-│       ├── main.tf
-│       ├── variables.tf
-│       └── outputs.tf
+│   │   └── docker-compose.yml      # Local: API + Postgres + Redis
+│   └── github/
+│       └── workflows/
+│           └── ci.yml              # Lint + test + build on PR
 │
 ├── scripts/
 │   ├── seed_data.py                # Load Medusa historical data
@@ -866,8 +995,8 @@ services:
     env_file: .env
     depends_on: [postgres, redis]
     volumes:
-      - ./src:/app/src        # hot reload
-      - ./models:/app/models  # local model artifacts
+      - ./src:/app/src          # hot reload
+      - ./models:/app/models    # local model artifacts (.joblib files)
 
   postgres:
     image: postgres:16-alpine
@@ -882,14 +1011,6 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
-
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
-    ports: ["9000:9000", "9001:9001"]
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
 
 volumes:
   pgdata:
@@ -951,7 +1072,7 @@ jobs:
 .PHONY: dev test lint train migrate
 
 dev:                          ## Start local dev environment
-	docker compose up -d postgres redis minio
+	docker compose up -d postgres redis
 	uvicorn src.api.main:app --reload --port 8000
 
 test:                         ## Run tests
@@ -1010,7 +1131,7 @@ Every log entry is JSON with correlation fields:
 
 | Dashboard | Metrics | Alert Threshold |
 |---|---|---|
-| **API Health** | Request rate, latency p50/p95/p99, error rate, uptime | Error rate > 1%, p95 > 100ms |
+| **API Health** | Request rate, latency p50/p95/p99, error rate, uptime | Error rate > 1%, p95 > 200ms |
 | **Model Performance** | MAE, RMSE, bias, % within 2oz (rolling 24h) | MAE increase > 20% vs 7-day avg |
 | **Feedback Loop** | Feedback rate, feedback latency, error distribution | Feedback rate drops below 50% |
 | **Drift Detection** | Feature distribution shift (PSI), prediction distribution | PSI > 0.2 on any feature |
@@ -1045,7 +1166,7 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 - API keys are hashed with bcrypt before storage.
 - Keys are scoped to a `warehouse_id` — a key can only access its own data.
 - Keys are passed via `Authorization: Bearer` header.
-- Rate limiting is per-key, enforced in Redis.
+- Rate limiting is per-key, enforced via Redis.
 
 ### Data Protection
 
@@ -1072,64 +1193,66 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 
 ## Development Phases
 
-### Phase 1: Foundation (Week 1-2)
+### Scope Philosophy
 
-**Goal:** Clean data, working feature pipeline, baseline metrics.
+Depth beats surface area. A system where predict, feedback, retrain, drift detection, and the model registry genuinely work end to end — with point-in-time features handled correctly — is more defensible and more useful than a broader system where half the subsystems are stubs. The phases below reflect what gets built; the rest of this README is the documented roadmap for what comes next.
+
+### Phase 1: Data & ML Foundation (Week 1-2)
+
+**Goal:** Clean data, correct feature pipeline, residual-target baseline.
 
 - [ ] Set up project structure, pyproject.toml, linting, CI.
 - [ ] Load Medusa historical data (seed script).
 - [ ] Exploratory data analysis notebook.
-- [ ] Implement `FeatureEngineer` class with unit tests.
-- [ ] Compute baseline metrics (theoretical weight MAE/RMSE).
-- [ ] Train first model candidates (linear, ridge, random forest, LightGBM).
-- [ ] Evaluation notebook with segment analysis.
+- [ ] Implement `FeatureEngineer` with point-in-time historical features and unit tests.
+- [ ] Compute baseline metrics (zero-adjustment = theoretical weight MAE/RMSE).
+- [ ] Train residual-target models (linear, ridge, random forest, LightGBM).
+- [ ] Conformal prediction intervals via MAPIE.
+- [ ] Evaluation notebook with segment analysis and error deep-dives.
 
-**Deliverable:** Jupyter notebooks, baseline report, trained model artifact.
+**Deliverable:** Notebooks, baseline report, trained model artifact, evaluation summary.
 
-### Phase 2: API (Week 3-4)
+### Phase 2: API & Feedback Loop (Week 3-4)
 
-**Goal:** Production API serving predictions.
+**Goal:** Working API with the full predict → feedback → retrain loop.
 
-- [ ] FastAPI application with predict endpoint.
-- [ ] Pydantic request/response schemas.
-- [ ] Model loading at startup.
-- [ ] Feedback endpoint.
+- [ ] FastAPI application with `/predict` and `/feedback` endpoints.
+- [ ] Pydantic request/response schemas (residual-based response).
+- [ ] Model loading at startup from local filesystem.
 - [ ] Health and readiness endpoints.
-- [ ] Docker + docker-compose for local dev.
 - [ ] PostgreSQL schema + Alembic migrations.
+- [ ] Redis-backed historical feature cache (background refresh task).
+- [ ] Docker + docker-compose for local dev (API + Postgres + Redis).
 - [ ] Unit and integration tests.
 
-**Deliverable:** Running API, Docker stack, test suite.
+**Deliverable:** Running API, Docker stack, test suite, feedback loop working.
 
-### Phase 3: Production Hardening (Week 5-6)
+### Phase 3: Model Operations (Week 5-6)
 
-**Goal:** Production-ready with monitoring and CI/CD.
+**Goal:** Retraining, model registry, drift detection — the pieces that make this production-grade.
 
-- [ ] API key authentication and rate limiting.
-- [ ] Structured logging (JSON).
-- [ ] Redis caching for prediction dedup.
-- [ ] Model registry (DB-backed).
-- [ ] Batch prediction endpoint.
-- [ ] CI/CD pipeline (GitHub Actions).
-- [ ] Load testing (benchmark script).
+- [ ] Model registry (DB-backed, with promotion workflow).
+- [ ] Training pipeline as CLI command (`make train VERSION=v1.1.0`).
+- [ ] Model comparison: challenger vs champion on holdout data.
+- [ ] Drift detection (PSI on features, rolling MAE monitoring).
+- [ ] API key authentication and rate limiting (Redis-backed).
+- [ ] Structured JSON logging with request correlation.
+- [ ] CI pipeline (GitHub Actions: lint + test + build).
 - [ ] Error handling and edge cases.
 
-**Deliverable:** Production-ready system, CI/CD pipeline, load test results.
+**Deliverable:** Production-ready system with retraining loop and monitoring.
 
-### Phase 4: ML Operations (Week 7-8)
+### Roadmap (Not Built in V1)
 
-**Goal:** Automated retraining and monitoring.
+These are documented in this design but deferred until the core is solid:
 
-- [ ] Training pipeline as CLI command.
-- [ ] Model comparison and promotion workflow.
-- [ ] Drift detection (PSI on features).
-- [ ] Production metrics dashboard.
-- [ ] Alerting rules.
-- [ ] Confidence intervals on predictions.
-- [ ] Historical feature lookup (avg SKU error, carton error).
-- [ ] Documentation.
-
-**Deliverable:** Full MLOps loop, monitoring dashboards, documentation.
+- Batch prediction endpoint (`/v1/batch-predict`)
+- Cloud deployment (Terraform, ECS/Cloud Run, RDS, ElastiCache)
+- Deploy and retrain CI/CD workflows
+- Production dashboards (Grafana/CloudWatch)
+- Alerting rules
+- Multi-warehouse model training
+- Load testing / benchmarking
 
 ---
 
@@ -1164,12 +1287,12 @@ These need answers before or during development:
 | Migrations | Alembic | 1.13+ |
 | Database | PostgreSQL | 16 |
 | Cache | Redis | 7 |
-| ML | scikit-learn, LightGBM | Latest |
+| ML | scikit-learn, LightGBM, MAPIE | Latest |
 | Feature Engineering | pandas, NumPy | Latest |
-| Object Storage | S3 / MinIO | Latest |
+| Object Storage | Local filesystem (dev), S3 (prod) | — |
 | Containerization | Docker | 24+ |
 | CI/CD | GitHub Actions | N/A |
 | Linting | Ruff | Latest |
 | Type Checking | mypy | Latest |
 | Testing | pytest | Latest |
-| Load Testing | locust or custom | Latest |
+| Confidence Intervals | MAPIE (conformal prediction) | Latest |
