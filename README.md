@@ -24,14 +24,44 @@ What's actually implemented right now, scoped to Phase 1 of
 - `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior
 - `tests/` — unit tests for data generation, feature engineering, and the API
 
-**Quick start:**
+## Quick Start
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
+
+# Train (generates synthetic data, trains gradient boosted trees, saves to models/model.joblib)
 PYTHONPATH=src python -m shipment_weight.train --out models/model.joblib
+
+# Serve
 PYTHONPATH=src uvicorn api.main:app --reload
+
+# Test
 pytest tests/
 ```
+
+With the API running, predict a shipment containing electronics and apparel items:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "theoretical_weight_oz": 100.0,
+    "item_count": 5,
+    "total_item_volume_in3": 800.0,
+    "item_categories": "electronics,apparel",
+    "category_mode": "electronics",
+    "carton_type": "L_16x12x10",
+    "ship_method": "GROUND",
+    "packing_material": "bubble_wrap",
+    "num_missing_catalog_weights": 0,
+    "category_avg_weight_error_oz": 0.5
+  }'
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow.
 
 ## Table of Contents
 

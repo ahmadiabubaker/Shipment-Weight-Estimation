@@ -32,6 +32,7 @@ def bias_by_segment(y_true: pd.Series, y_pred: np.ndarray, segment: pd.Series, s
 
 
 def bias_by_item_count_bucket(y_true: pd.Series, y_pred: np.ndarray, item_count: pd.Series) -> pd.DataFrame:
+    """Bucket shipments by item_count and report bias/MAE per bucket."""
     buckets = pd.cut(item_count, bins=[0, 2, 5, 9, 100], labels=["1-2", "3-5", "6-9", "10+"])
     return bias_by_segment(y_true, y_pred, buckets, "item_count_bucket")
 
