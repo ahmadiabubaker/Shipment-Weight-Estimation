@@ -11,7 +11,9 @@ def regression_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float
     rmse = mean_squared_error(y_true, y_pred) ** 0.5
     bias = float(np.mean(y_pred - y_true))
     within_2oz = float(np.mean(np.abs(y_pred - y_true) <= 2.0)) * 100
-    return {"mae_oz": mae, "rmse_oz": rmse, "bias_oz": bias, "within_2oz_pct": within_2oz}
+    within_0_5oz = float(np.mean(np.abs(y_pred - y_true) <= 0.5)) * 100
+    within_1lb = float(np.mean(np.abs(y_pred - y_true) <= 16.0)) * 100
+    return {"mae_oz": mae, "rmse_oz": rmse, "bias_oz": bias, "within_2oz_pct": within_2oz, "within_0_5oz_pct": within_0_5oz, "within_1lb_pct": within_1lb}
 
 
 def compare_to_baseline(y_true: pd.Series, y_pred: np.ndarray, theoretical: pd.Series) -> pd.DataFrame:

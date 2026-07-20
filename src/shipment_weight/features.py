@@ -21,7 +21,7 @@ NUMERIC_FEATURES = [
     "theoretical_weight_oz",
     "item_count",
     "total_item_volume_in3",
-    "num_missing_catalog_weights",
+    "void_volume_in3",
     "category_avg_weight_error_oz",
     "weight_per_item_oz",
     "fill_ratio",
@@ -37,11 +37,23 @@ ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add features computable from the raw shipment columns. Idempotent."""
+    """Add features computable from the raw shipment columns. Idempotent.
+
+    When a ``box_volume_in3`` column is present (real warehouse data where
+    box_name doesn't match the synthetic CARTON_CAPACITY keys), it is used as
+    a fallback capacity so fill_ratio is still meaningful.
+    """
     df = df.copy()
     df["weight_per_item_oz"] = df["theoretical_weight_oz"] / df["item_count"].clip(lower=1)
-    df["carton_capacity_in3"] = df["carton_type"].map(CARTON_CAPACITY)
+    capacity = df["carton_type"].map(CARTON_CAPACITY)
+    if "box_volume_in3" in df.columns:
+        capacity = capacity.fillna(df["box_volume_in3"])
+    df["carton_capacity_in3"] = capacity
     df["fill_ratio"] = (df["total_item_volume_in3"] / df["carton_capacity_in3"]).clip(upper=1.5)
+    if "box_volume_in3" in df.columns:
+        df["void_volume_in3"] = (df["box_volume_in3"] - df["total_item_volume_in3"]).clip(lower=0)
+    else:
+        df["void_volume_in3"] = 0.0
     df["num_categories"] = df["item_categories"].fillna("").apply(
         lambda s: len([c for c in s.split(",") if c])
     )
