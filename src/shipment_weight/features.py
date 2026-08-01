@@ -15,6 +15,13 @@ from shipment_weight.data_gen import CARTON_TYPES
 
 TARGET = "actual_weight_oz"
 
+# Synthetic-data-only. Real carton_type values are warehouse box names
+# (e.g. "14x10x8") and essentially never match these 4 keys, so this dict
+# is only ever consulted by the Phase 1 synthetic pipeline (data_gen.py /
+# train.py) and tests that use synthetic carton names. Real training
+# (scripts/train_real_data.py) and the library (shipment_weight.predict)
+# always supply a real box_volume_in3, which add_derived_features prefers
+# as the fallback below -- do not extend this dict for real carton types.
 CARTON_CAPACITY = {name: capacity for name, capacity, _ in CARTON_TYPES}
 
 NUMERIC_FEATURES = [

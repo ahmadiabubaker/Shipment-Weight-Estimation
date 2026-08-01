@@ -1,5 +1,20 @@
 """Minimal FastAPI service for shipment weight prediction.
 
+SECONDARY interface. The primary deliverable is the shipment_weight
+library (see src/shipment_weight/predict.py) -- import and call it directly
+if you're consuming this from Python. This module is left as-is,
+unmodified, pending a decision on whether/how to wire it up as a thin
+wrapper around the library.
+
+Known limitation, unresolved here: ShipmentRequest takes pre-aggregated
+features (theoretical_weight_oz, total_item_volume_in3, ...), not raw box
+dimensions or item lines, so it cannot compute fill_ratio/void_volume_in3
+from a real carton the way shipment_weight.predict now does -- see that
+module's docstring for the full story. Fixing this endpoint means changing
+ShipmentRequest to accept box dims + item lines like
+shipment_weight.predict.Shipment does, which hasn't been done here by design
+(this interface is deprioritized; ask before extending it).
+
 Loads a trained model bundle (pipeline + residual std) at startup. No DB,
 Redis, or auth yet -- those are documented as future-state in README.md and
 will be added once deployment scope is confirmed with the client.
