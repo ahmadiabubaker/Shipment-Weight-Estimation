@@ -6,9 +6,11 @@ Pipeline stages (all in one run):
   3. Feats  — join order lines → per-shipment aggregates → model columns
   4. Split  — time-based: train = Jan–May 2026, test = June 2026
   5. Encode — compute category_avg_weight_error_oz from training fold only
-  6. Train  — all 4 model candidates vs theoretical-weight baseline
+  6. Train  — linear/ridge/random_forest/gradient_boosted_trees (MODEL_CANDIDATES)
+              plus histgbt_absolute_error (own dense pipeline, see
+              make_histgbt_pipeline) vs theoretical-weight baseline
   7. Eval   — MAE/RMSE/bias overall; sliced by box_name, ship_method, item_count
-  8. Save   — GBT bundle → models/model.joblib  (version v0.2.0-real-data)
+  8. Save   — bundle → models/model.joblib  (version v0.5.0-histgbt)
 
 Usage:
     python scripts/train_real_data.py \\
@@ -26,6 +28,11 @@ import warnings
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -36,12 +43,58 @@ from shipment_weight.evaluate import (
     largest_errors,
     regression_metrics,
 )
-from shipment_weight.features import ALL_FEATURES, TARGET, add_derived_features
+from shipment_weight.features import ALL_FEATURES, CATEGORICAL_FEATURES, NUMERIC_FEATURES, TARGET, add_derived_features
+from shipment_weight.ingest import LBS_TO_OZ, apply_category_map
+from shipment_weight.ingest import build_features as _build_features_shared
 from shipment_weight.train import MODEL_CANDIDATES, make_pipeline
 
-MODEL_VERSION = "v0.4.0-real-data"
-PREFERRED_MODEL = "ridge"  # Ridge outperforms GBT on this near-linear calibration problem
-LBS_TO_OZ = 16.0
+MODEL_VERSION = "v0.5.0-histgbt"
+# histgbt_absolute_error beat ridge on both average error (0.643 vs 0.709 lbs
+# MAE, 84.4% vs 81.2% within-1lb) and on a full diagnostic pass over Ridge's
+# known weak spots (scripts/evaluate_histgbt_diagnostics.py): it largely
+# fixes the FedEx HAZMAT bias (+10.77 -> -2.31 oz) and improves low-item-count
+# error, at the cost of one small new regression (box 26x20x8, 49 rows/0.5%
+# of test) and no fix for the 30x20x12 box, which remains the dominant error
+# source for both models. See MODEL_CARD.md "Model Selection" for the full
+# story and scripts/evaluate_model_sweep.py for why no other library (tuned
+# HistGBT, LightGBM, XGBoost, CatBoost) beat this untuned baseline -- 4
+# boosting libraries converged within 0.28 oz of each other and ~3.8 oz of
+# the ~6.5 oz repeat-shipment noise floor (scripts/check_noise_floor.py).
+PREFERRED_MODEL = "histgbt_absolute_error"
+
+# Same untuned config that won scripts/evaluate_model_sweep.py's tuning sweep
+# (tuning bought ~0.00 oz over these defaults, so they're kept as-is here).
+HISTGBT_KWARGS = dict(
+    loss="absolute_error", max_iter=400, learning_rate=0.05,
+    max_depth=None, min_samples_leaf=40, l2_regularization=1.0,
+    early_stopping=True, validation_fraction=0.1, random_state=42,
+)
+
+
+def make_histgbt_pipeline() -> Pipeline:
+    """Separate from shipment_weight.train.make_pipeline (used by the other
+    MODEL_CANDIDATES) because HistGradientBoostingRegressor cannot consume a
+    sparse matrix, unlike linear/ridge/random_forest/gradient_boosted_trees --
+    same NUMERIC_FEATURES/CATEGORICAL_FEATURES from shipment_weight.features
+    and the same X_train/y_train built from ingest.py either way, just a
+    densified ColumnTransformer for this one estimator (sparse_threshold=0.0
+    forces the one-hot block dense; harmless for tree splits, just costs a
+    little more memory for ~9-12 dummy columns)."""
+    numeric_pipeline = Pipeline(
+        steps=[("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[("impute", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]
+    )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, NUMERIC_FEATURES),
+            ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),
+        ],
+        sparse_threshold=0.0,
+    )
+    return Pipeline(steps=[("preprocess", preprocessor), ("model", HistGradientBoostingRegressor(**HISTGBT_KWARGS))])
+
 
 # Catches: "Pick Up At Medusa", "Pick Up at Medusa", "Pickup At Medusa",
 #          "CanceledItem", "Ship Outside System", "Ship Outside System Int"
@@ -137,86 +190,31 @@ def clean(ships_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 # ── Stage 3: Feature engineering ──────────────────────────────────────────────
-
-def _safe_mode(s: pd.Series) -> str:
-    m = s.dropna().mode()
-    return str(m.iloc[0]) if len(m) > 0 else "unknown"
-
-
-def aggregate_lines(lines: pd.DataFrame) -> pd.DataFrame:
-    """Collapse order-line rows to one row per shipment_number.
-
-    2,153 duplicate (shipment_number, item_id) pairs exist in the raw data
-    (audit finding). These are treated as double-entry errors; we keep the
-    first occurrence so quantities are not double-counted.
-    """
-    lines = lines.copy()
-    before = len(lines)
-    lines = lines.drop_duplicates(subset=["shipment_number", "item_id"], keep="first")
-    dropped = before - len(lines)
-    if dropped:
-        print(f"  Deduplicated {dropped:,} duplicate (shipment_number, item_id) rows in order lines")
-    lines["item_volume_in3"] = (
-        lines["item_width_inches"].fillna(0)
-        * lines["item_length_inches"].fillna(0)
-        * lines["item_height_inches"].fillna(0)
-        * lines["item_quantity"].fillna(1)
-    )
-    lines["missing_wt"] = lines["theoretical_item_weight_lbs"].isnull().astype(int)
-
-    return (
-        lines.groupby("shipment_number")
-        .agg(
-            item_count=("item_quantity", "sum"),
-            distinct_sku_count=("item_id", "nunique"),
-            total_item_volume_in3=("item_volume_in3", "sum"),
-            category_mode=("category", _safe_mode),
-            item_categories=("category", lambda s: ",".join(sorted(s.dropna().unique()))),
-            num_missing_catalog_weights=("missing_wt", "sum"),
-        )
-        .reset_index()
-    )
-
+#
+# The actual column-building logic (aggregate_lines, build_features) now
+# lives in shipment_weight.ingest so shipment_weight.predict can reuse it
+# unchanged for live inference -- no second, simplified feature path. This
+# wrapper only adds the operator-facing diagnostic prints this script has
+# always produced around that shared logic.
 
 def build_features(ships: pd.DataFrame, lines: pd.DataFrame) -> pd.DataFrame:
     _hr("STAGE 3 — FEATURE ENGINEERING")
-    agg = aggregate_lines(lines)
-    print(f"  Order-line aggregates: {len(agg):,} unique shipment_numbers")
 
-    df = ships.merge(agg, on="shipment_number", how="left")
-    no_lines = df["item_count"].isnull().sum()
+    dup_lines = int(lines.duplicated(subset=["shipment_number", "item_id"]).sum())
+    if dup_lines:
+        print(f"  Deduplicated {dup_lines:,} duplicate (shipment_number, item_id) rows in order lines")
+
+    line_shipment_ids = set(lines["shipment_number"].dropna().unique())
+    print(f"  Order-line aggregates: {len(line_shipment_ids):,} unique shipment_numbers")
+    no_lines = int((~ships["shipment_number"].isin(line_shipment_ids)).sum())
     print(f"  Shipments with no matching order lines: {no_lines:,}  (item_count filled with 1)")
-    df["item_count"] = df["item_count"].fillna(1).clip(lower=1)
-    df["total_item_volume_in3"] = df["total_item_volume_in3"].fillna(0)
-    df["num_missing_catalog_weights"] = df["num_missing_catalog_weights"].fillna(0)
-    df["item_categories"] = df["item_categories"].fillna("unknown")
-    df["category_mode"] = df["category_mode"].fillna("unknown")
 
-    # Unit conversions lbs → oz
-    df["theoretical_weight_oz"] = df["total_theoretical_shipment_weight_lbs"] * LBS_TO_OZ
-    df["actual_weight_oz"] = df["actual_weight_lbs"] * LBS_TO_OZ
+    null_box = int(ships["box_name"].isnull().sum())
 
-    # Fill null box_name with "{length}x{width}x{height}" before any carton features
-    null_box = df["box_name"].isnull()
-    if null_box.any():
-        df.loc[null_box, "box_name"] = (
-            df.loc[null_box, "box_length"].fillna(0).round(0).astype(int).astype(str) + "x" +
-            df.loc[null_box, "box_width"].fillna(0).round(0).astype(int).astype(str) + "x" +
-            df.loc[null_box, "box_height"].fillna(0).round(0).astype(int).astype(str)
-        )
-        print(f"  Filled {null_box.sum():,} null box_name values with dimension strings")
+    df = _build_features_shared(ships, lines)
 
-    # Carton identity and box volume (void_volume_in3 derived later in add_derived_features)
-    df["carton_type"] = df["box_name"].fillna("UNKNOWN_BOX")
-    df["box_volume_in3"] = df["box_length"] * df["box_width"] * df["box_height"]
-
-    # packing_material is not captured in real data;
-    # OneHotEncoder(handle_unknown='ignore') will produce all-zero encoding
-    df["packing_material"] = "unknown"
-
-    # category_avg_weight_error_oz is filled after the time split (train-only encoding)
-    df["category_avg_weight_error_oz"] = np.nan
-
+    if null_box:
+        print(f"  Filled {null_box:,} null box_name values with dimension strings")
     print(f"  Feature dataframe shape: {df.shape}")
     return df
 
@@ -238,6 +236,23 @@ def time_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 # ── Stage 5: Category error encoding ─────────────────────────────────────────
 
+def category_error_map(train: pd.DataFrame) -> tuple[dict, float]:
+    """Category -> mean training residual (oz), plus the global fallback
+    mean for categories unseen in train. Factored out of
+    encode_category_error so Stage 8 can persist the map itself into the
+    saved model bundle -- shipment_weight.predict applies it the same way
+    (via apply_category_map) at serving time, using apply_category_map so
+    callers never have to supply category_avg_weight_error_oz by hand.
+    """
+    train_error = train["actual_weight_oz"] - train["theoretical_weight_oz"]
+    cat_map = (
+        pd.DataFrame({"cat": train["category_mode"], "err": train_error})
+        .groupby("cat")["err"]
+        .mean()
+    )
+    return cat_map.to_dict(), float(train_error.mean())
+
+
 def encode_category_error(
     train: pd.DataFrame, test: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -247,22 +262,16 @@ def encode_category_error(
     Unknown categories in test fall back to the global training mean.
     """
     _hr("STAGE 5 — CATEGORY ERROR ENCODING  (train-fold only)")
-    train_error = train["actual_weight_oz"] - train["theoretical_weight_oz"]
-    cat_map = (
-        pd.DataFrame({"cat": train["category_mode"], "err": train_error})
-        .groupby("cat")["err"]
-        .mean()
-    )
-    global_mean = float(train_error.mean())
+    cat_map, global_mean = category_error_map(train)
     print(f"  Unique categories in train: {len(cat_map):,}")
     print(f"  Global mean error (train) : {global_mean:.2f} oz  ({global_mean/LBS_TO_OZ:.3f} lbs)")
-    n_unseen = test["category_mode"].isin(cat_map.index).eq(False).sum()
+    n_unseen = test["category_mode"].isin(cat_map.keys()).eq(False).sum()
     print(f"  Test categories unseen in train (→ global mean): {n_unseen:,} rows")
 
     train = train.copy()
     test = test.copy()
-    train["category_avg_weight_error_oz"] = train["category_mode"].map(cat_map).fillna(global_mean)
-    test["category_avg_weight_error_oz"] = test["category_mode"].map(cat_map).fillna(global_mean)
+    train["category_avg_weight_error_oz"] = apply_category_map(train["category_mode"], cat_map, global_mean)
+    test["category_avg_weight_error_oz"] = apply_category_map(test["category_mode"], cat_map, global_mean)
     return train, test
 
 
@@ -272,6 +281,8 @@ def train_and_evaluate(
     train: pd.DataFrame,
     test: pd.DataFrame,
     out_path: str,
+    cat_error_map: dict,
+    cat_error_global_mean: float,
 ) -> None:
     # Derive fill_ratio, weight_per_item_oz, etc.
     train = add_derived_features(train)
@@ -285,13 +296,15 @@ def train_and_evaluate(
 
     # ── Model comparison ──────────────────────────────────────────────────────
     _hr("STAGE 6 — MODEL COMPARISON  (test = June 2026)")
-    header = f"{'Model':<32} {'MAE oz':>8} {'MAE lbs':>8} {'RMSE oz':>8} {'Bias oz':>9} {'≤0.5oz%':>9} {'≤1.0lb%':>9}"
+    header = (f"{'Model':<32} {'MAE oz':>8} {'MAE lbs':>8} {'RMSE oz':>8} {'Bias oz':>9} "
+              f"{'≤0.5oz%':>9} {'≤0.3lb%':>9} {'≤0.5lb%':>9} {'≤1.0lb%':>9}")
     print(header)
     print("-" * len(header))
 
     base = regression_metrics(y_test, theoretical_test_oz.values)
     print(f"  {'theoretical_baseline':<30} {base['mae_oz']:>8.2f} {base['mae_oz']/LBS_TO_OZ:>8.3f} "
-          f"{base['rmse_oz']:>8.2f} {base['bias_oz']:>9.2f} {base['within_0_5oz_pct']:>8.1f}% {base['within_1lb_pct']:>8.1f}%")
+          f"{base['rmse_oz']:>8.2f} {base['bias_oz']:>9.2f} {base['within_0_5oz_pct']:>8.1f}% "
+          f"{base['within_0_3lb_pct']:>8.1f}% {base['within_0_5lb_pct']:>8.1f}% {base['within_1lb_pct']:>8.1f}%")
 
     best_pipeline, best_preds, best_name, best_mae = None, None, "", float("inf")
     all_results: dict[str, tuple] = {}
@@ -308,7 +321,26 @@ def train_and_evaluate(
             best_pipeline, best_preds, best_name = pipe, preds, name
             marker = " ◀ best"
         print(f"  {name:<30} {m['mae_oz']:>8.2f} {m['mae_oz']/LBS_TO_OZ:>8.3f} "
-              f"{m['rmse_oz']:>8.2f} {m['bias_oz']:>9.2f} {m['within_0_5oz_pct']:>8.1f}% {m['within_1lb_pct']:>8.1f}%{marker}")
+              f"{m['rmse_oz']:>8.2f} {m['bias_oz']:>9.2f} {m['within_0_5oz_pct']:>8.1f}% "
+              f"{m['within_0_3lb_pct']:>8.1f}% {m['within_0_5lb_pct']:>8.1f}% {m['within_1lb_pct']:>8.1f}%{marker}")
+
+    # histgbt_absolute_error isn't part of MODEL_CANDIDATES (see
+    # make_histgbt_pipeline's docstring for why it needs its own dense
+    # pipeline) but goes through the exact same X_train/y_train/X_test built
+    # from ingest.py/features.py above, and is scored/compared the same way.
+    histgbt_pipeline = make_histgbt_pipeline()
+    histgbt_pipeline.fit(X_train, y_train)
+    histgbt_preds = histgbt_pipeline.predict(X_test)
+    histgbt_m = regression_metrics(y_test, histgbt_preds)
+    all_results["histgbt_absolute_error"] = (histgbt_pipeline, histgbt_preds, histgbt_m)
+    marker = ""
+    if histgbt_m["mae_oz"] < best_mae:
+        best_mae = histgbt_m["mae_oz"]
+        best_pipeline, best_preds, best_name = histgbt_pipeline, histgbt_preds, "histgbt_absolute_error"
+        marker = " ◀ best"
+    print(f"  {'histgbt_absolute_error':<30} {histgbt_m['mae_oz']:>8.2f} {histgbt_m['mae_oz']/LBS_TO_OZ:>8.3f} "
+          f"{histgbt_m['rmse_oz']:>8.2f} {histgbt_m['bias_oz']:>9.2f} {histgbt_m['within_0_5oz_pct']:>8.1f}% "
+          f"{histgbt_m['within_0_3lb_pct']:>8.1f}% {histgbt_m['within_0_5lb_pct']:>8.1f}% {histgbt_m['within_1lb_pct']:>8.1f}%{marker}")
 
     # ── Preferred-model override for save + detailed eval ────────────────────
     if PREFERRED_MODEL in all_results:
@@ -387,6 +419,13 @@ def train_and_evaluate(
         "model_version": MODEL_VERSION,
         "residual_std": float(residuals.std()),
         "trained_on_rows": len(X_train),
+        "feature_list": list(ALL_FEATURES),
+        # category_avg_weight_error_oz's train-fold map, baked into the
+        # artifact so shipment_weight.predict can apply it at serving time
+        # (via apply_category_map) instead of requiring callers to supply
+        # this value themselves -- it was never exposed anywhere before.
+        "category_error_map": cat_error_map,
+        "category_error_global_mean": cat_error_global_mean,
     }
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     joblib.dump(bundle, out_path)
@@ -395,6 +434,7 @@ def train_and_evaluate(
     print(f"  model_type    : {best_name}")
     print(f"  training rows : {len(X_train):,}")
     print(f"  residual_std  : {residuals.std():.2f} oz  ({residuals.std()/LBS_TO_OZ:.3f} lbs)")
+    print(f"  category_error_map: {len(cat_error_map):,} categories  (+global fallback mean)")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -415,8 +455,9 @@ def main() -> None:
     ships, _ = clean(ships_raw)
     df = build_features(ships, lines_raw)
     train, test = time_split(df)
+    cat_map, cat_global_mean = category_error_map(train)
     train, test = encode_category_error(train, test)
-    train_and_evaluate(train, test, args.out)
+    train_and_evaluate(train, test, args.out, cat_map, cat_global_mean)
 
     _hr("DONE")
 
