@@ -1,22 +1,32 @@
-"""Evaluate predictions after rounding to the nearest whole-pound billing
+"""Evaluate predictions after rounding UP to the next whole-pound billing
 tier, side by side with the existing continuous-prediction metrics.
 
-Tomas asked us to round predictions to the nearest pound before measuring
-accuracy, since delivery carriers round actual shipment weight the same way
-before billing/labeling -- the comparison should reflect real-world
-billing-tier matching, not raw continuous error.
+Tomas asked us to round predictions before measuring accuracy, since
+delivery carriers round shipment weight the same way before billing/
+labeling -- the comparison should reflect real-world billing-tier matching,
+not raw continuous error. His example was USPS-style rounding (always UP,
+never down or to nearest: 9.1 -> 10, 9.99 -> 10) -- given as an example of
+the general principle, not a USPS-only rule.
 
-Rounding rule (verified against real data before implementing):
-  - actual_weight_lbs >= 1 lb: 80-90%+ of values are exact whole numbers in
-    every weight bucket (99% in the 50-100 lb range) -- strong evidence
-    carriers round to the nearest pound here. Predictions >= 1 lb are
-    rounded to match.
-  - actual_weight_lbs < 1 lb: only ~20% of values land on an exact
-    quarter-pound (.25/.5/.75); real examples include 0.51, 0.55, 0.78,
-    0.98, which aren't quarter-pound multiples. No quarter-pound rounding
-    rule holds here, so predictions < 1 lb are left unrounded. This bucket
-    is ~1.3% of the dataset (842 of 66,224 rows) -- reported below, not
-    silently dropped.
+Rounding rule (verified against real data before implementing; see
+shipment_weight/rounding.py's module docstring for the full ceiling-vs-
+nearest verification):
+  - weight >= 1 lb: ALWAYS round up to the next whole pound. Confirmed in
+    this dataset by comparing the same carrier's rows with and without the
+    "(Perseuss)" capture-system tag: plain-tagged rows are 97-99% already
+    whole (i.e. already carrier-rounded), while the identical carrier's
+    "(Perseuss)"-tagged rows are only 53-66% whole (raw, not-yet-rounded
+    scale readings) -- a data-capture-system artifact, not a
+    carrier-specific rounding policy. Both predictions AND the actual
+    weight get this same treatment before comparing, so "does the label
+    match the bill" is judged against what was truly billed, not against
+    whichever system happened to capture that particular row.
+  - weight < 1 lb: only ~20% of values land on an exact quarter-pound
+    (.25/.5/.75); real examples include 0.51, 0.55, 0.78, 0.98, which
+    aren't quarter-pound multiples. No quarter-pound rounding rule holds
+    here, so weights < 1 lb (predicted or actual) are left unrounded. This
+    bucket is ~1.3% of the dataset (842 of 66,224 rows) -- reported below,
+    not silently dropped.
 
 This is evaluation-only: no model is retrained or modified. Reuses the
 exact same load/clean/build_features/time_split/encode_category_error
@@ -59,14 +69,21 @@ EXTENDED_MODEL_PATH = os.path.join(REPO_ROOT, "models", "model_extended.joblib")
 
 
 def rounded_metrics(actual_lbs: np.ndarray, rounded_pred_lbs: np.ndarray) -> dict[str, float]:
-    err = rounded_pred_lbs - actual_lbs
+    """actual_lbs is rounded UP the same way predictions are (see
+    shipment_weight.rounding) before comparing -- a meaningful share of
+    actual_weight_lbs values are raw, not-yet-rounded scale readings (the
+    "(Perseuss)"-tagged rows; see rounding.py's module docstring), so
+    comparing a rounded prediction against a raw actual would understate
+    how often the label truly matches what the carrier bills."""
+    actual_rounded, _ = round_to_billing_tier(np.asarray(actual_lbs, dtype=float))
+    err = rounded_pred_lbs - actual_rounded
     abs_err = np.abs(err)
     return {
         "mae_lbs": float(np.mean(abs_err)),
         "rmse_lbs": float(np.sqrt(np.mean(err ** 2))),
         "bias_lbs": float(np.mean(err)),
         "within_1lb_pct": float(np.mean(abs_err <= 1.0)) * 100,
-        "exact_match_pct": float(np.mean(np.isclose(rounded_pred_lbs, actual_lbs, atol=1e-6))) * 100,
+        "exact_match_pct": float(np.mean(np.isclose(rounded_pred_lbs, actual_rounded, atol=1e-6))) * 100,
     }
 
 
@@ -138,12 +155,12 @@ def main() -> None:
 
     train, test, lines_raw = prepare(args.shipments, args.lines, refresh=args.refresh, with_lines=True)
 
-    _hr("EVALUATE: PREDICTIONS ROUNDED TO NEAREST BILLING-TIER POUND")
-    print("  Rounding predictions >= 1 lb to the nearest whole pound before scoring,")
-    print("  since carriers round actual weight the same way before billing (verified")
-    print("  against real data -- see module docstring). This is NOT a new/better model;")
-    print("  it's the same predictions evaluated through a rounding step that mirrors")
-    print("  carrier behavior.")
+    _hr("EVALUATE: PREDICTIONS ROUNDED UP TO THE NEXT BILLING-TIER POUND")
+    print("  Rounding weights >= 1 lb UP to the next whole pound before scoring -- both")
+    print("  predictions AND actual weight -- since carriers round this way before billing")
+    print("  (verified against real data -- see module docstring). This is NOT a new/better")
+    print("  model; it's the same predictions (and the same actual weights) evaluated")
+    print("  through a rounding step that mirrors carrier behavior.")
 
     bundle = joblib.load(PROD_MODEL_PATH)
     X_test_prod = test[bundle["feature_list"]]

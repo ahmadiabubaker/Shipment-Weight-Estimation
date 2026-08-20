@@ -88,11 +88,12 @@ class WeightPrediction:
     # tracking, evaluation, and anything statistical. Unchanged by the
     # addition of predicted_weight_lbs_for_label below.
     predicted_weight_lbs: float
-    # Rounded per shipment_weight.rounding.round_to_billing_tier: nearest
-    # whole pound for predictions >= 1 lb (carriers round their own
-    # measured weight the same way before billing -- verified against real
-    # data), left unrounded below 1 lb. This is the presentation-layer
-    # value meant for a physical shipping label, not for accuracy tracking.
+    # Rounded per shipment_weight.rounding.round_to_billing_tier: ALWAYS
+    # rounds UP to the next whole pound for predictions >= 1 lb (never down
+    # or to nearest -- carriers round their own measured weight the same
+    # way before billing, verified against real data), left unrounded
+    # below 1 lb. This is the presentation-layer value meant for a physical
+    # shipping label, not for accuracy tracking.
     predicted_weight_lbs_for_label: float
     theoretical_weight_oz: float
     theoretical_weight_lbs: float

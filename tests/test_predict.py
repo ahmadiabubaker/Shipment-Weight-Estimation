@@ -126,8 +126,8 @@ def test_predictor_includes_rounded_label_field(bundle_path):
     shipment_weight.rounding.round_to_billing_tier produces for this
     prediction's own precise value -- proves the field is derived from the
     shared rounding function (not a second, possibly-drifted implementation)
-    and follows the verified rule: >=1lb rounds to the nearest whole pound,
-    <1lb stays unrounded."""
+    and follows the verified rule: >=1lb ALWAYS rounds up to the next whole
+    pound (never down or to nearest), <1lb stays unrounded."""
     predictor = ShipmentWeightPredictor.load(bundle_path)
     result = predictor.predict(_real_world_shipment())
 
@@ -141,7 +141,8 @@ def test_predictor_includes_rounded_label_field(bundle_path):
         assert result.predicted_weight_lbs_for_label == pytest.approx(result.predicted_weight_lbs)
     else:
         # Precise prediction was >= 1lb: label field must be a whole number
-        # (e.g. a precise 12.34 lbs prediction would become 12.0).
+        # (e.g. a precise 12.01 lbs prediction would become 13.0 -- rounds
+        # all the way up, not to the nearer 12.0).
         assert result.predicted_weight_lbs_for_label == round(result.predicted_weight_lbs_for_label)
 
     # Confidence interval must stay based on the PRECISE prediction, not the
@@ -153,12 +154,13 @@ def test_predictor_includes_rounded_label_field(bundle_path):
 
 def test_rounding_examples_from_spec():
     """The exact worked examples from the rounding spec: a precise 12.34 lbs
-    prediction rounds to 12 for the label; a precise 0.7 lbs prediction
-    stays unrounded. Exercised directly against the shared rounding
-    function (predict.py delegates to this same function -- see
+    prediction ALWAYS rounds up to 13 for the label (never down to 12,
+    never "nearest") -- Tomas's carrier-billing rule; a precise 0.7 lbs
+    prediction stays unrounded. Exercised directly against the shared
+    rounding function (predict.py delegates to this same function -- see
     test_predictor_includes_rounded_label_field for the delegation check)."""
     rounded, _ = round_to_billing_tier(12.34)
-    assert float(rounded) == 12.0
+    assert float(rounded) == 13.0
 
     rounded, _ = round_to_billing_tier(0.7)
     assert float(rounded) == 0.7

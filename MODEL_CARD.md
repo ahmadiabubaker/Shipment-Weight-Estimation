@@ -283,12 +283,23 @@ docstring.
 `predicted_weight_lbs` (precise, unrounded — for accuracy tracking and
 evaluation) and `predicted_weight_lbs_for_label` (rounded for a physical
 shipping label). The rounding follows the same carrier-billing rule used
-throughout this card and `scripts/evaluate_rounded.py`: nearest whole pound
-for predictions ≥ 1 lb (carriers round their own measured weight to the
-nearest pound before billing — verified real-data finding, not an
-assumption), left unrounded below 1 lb (a quarter-pound rule was tested for
-that range and does not hold in real data). Both the library
-(`shipment_weight.predict`) and `scripts/evaluate_rounded.py` call the same
+throughout this card and `scripts/evaluate_rounded.py`: **always round UP**
+to the next whole pound for predictions ≥ 1 lb — never down, never to
+nearest (e.g. 12.01 → 13, not 12) — left unrounded below 1 lb (a
+quarter-pound rule was tested for that range and does not hold in real
+data). This mirrors real carrier billing (e.g. USPS), and is not
+carrier-specific in this dataset: comparing the same carrier's rows with
+and without the "(Perseuss)" capture-system tag shows plain-tagged rows are
+97-99% already-whole (already carrier-rounded) while the identical
+carrier's "(Perseuss)"-tagged rows are only 53-66% whole (raw,
+not-yet-rounded scale readings) — a data-capture-system artifact, not a
+carrier-specific rounding policy. `scripts/evaluate_rounded.py` applies the
+same round-up rule to the actual weight being compared against, for the
+same reason: a meaningful share of `actual_weight_lbs` values are
+"(Perseuss)"-tagged raw readings, not yet carrier-rounded, so comparing a
+rounded prediction against a raw actual would understate real label-match
+accuracy. Both the library (`shipment_weight.predict`) and
+`scripts/evaluate_rounded.py` call the same
 `shipment_weight.rounding.round_to_billing_tier` function, so there is one
 place the rule is encoded. `confidence_interval_oz` is deliberately computed
 from the precise prediction, not the rounded label value — rounding is a

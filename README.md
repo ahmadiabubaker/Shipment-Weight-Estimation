@@ -63,10 +63,11 @@ shipment = Shipment(
 result = predictor.predict(shipment)
 print(result.predicted_weight_lbs)            # 3.119 -- precise, unrounded: use for accuracy
                                                 #          tracking, evaluation, anything statistical
-print(result.predicted_weight_lbs_for_label)   # 3.0   -- rounded to the nearest whole pound the way
-                                                #          a carrier rounds its own measured weight
-                                                #          before billing: this is what goes on a
-                                                #          physical shipping label, not the line above
+print(result.predicted_weight_lbs_for_label)   # 4.0   -- rounded UP to the next whole pound (never
+                                                #          down, never to nearest) the way a carrier
+                                                #          rounds its own measured weight before
+                                                #          billing: this is what goes on a physical
+                                                #          shipping label, not the line above
 print(result.confidence_interval_oz)           # always based on the precise prediction, never the
                                                 #          rounded label value -- rounding is a display
                                                 #          step, not a statistical one
@@ -78,11 +79,12 @@ at training time (`shipment_weight.ingest` + `shipment_weight.features`), so
 `fill_ratio`, `void_volume_in3`, and `category_avg_weight_error_oz` are
 computed from your actual shipment, not defaulted or imputed.
 
-`predicted_weight_lbs_for_label` rounds to the nearest whole pound for
-predictions >= 1 lb and leaves predictions < 1 lb unrounded — verified
-against real data (carriers round their own measured weight to the nearest
-pound before billing for the >=1lb case; a quarter-pound rule was tested for
-the <1lb case and does not hold). Same rounding function
+`predicted_weight_lbs_for_label` ALWAYS rounds up to the next whole pound
+for predictions >= 1 lb (e.g. 3.12 -> 4, never down and never "nearest")
+and leaves predictions < 1 lb unrounded — verified against real data
+(carriers round their own measured weight UP before billing for the >=1lb
+case; a quarter-pound rule was tested for the <1lb case and does not hold).
+Same rounding function
 (`shipment_weight.rounding.round_to_billing_tier`) used by
 `scripts/evaluate_rounded.py` to score predictions the way a carrier would
 bill them — see [MODEL_CARD.md](MODEL_CARD.md) for that evaluation.
