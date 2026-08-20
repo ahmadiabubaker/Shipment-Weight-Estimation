@@ -1,28 +1,29 @@
-# Shipment Weight Estimation Service
+# Shipment Weight Estimation
 
-> A production-grade ML-powered API that predicts the actual packed weight of warehouse shipments, replacing inaccurate theoretical weight calculations with data-driven predictions.
+> A Python library that predicts the actual packed weight of warehouse shipments from real box dimensions and order-line data, replacing inaccurate theoretical weight calculations with a data-driven correction.
 
-**Status:** Design Phase (this README) / **Phase 1 implementation in progress** (see below)
+**Status:** Phase 1 implementation in progress. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
+
 ---
 
 ## Current Implementation Status
 
-Everything below this section documents the eventual production-grade design
-(Postgres, Redis, Docker, auth, model registry, drift detection). None of
-that exists yet, and it isn't being built until real data and deployment
-scope are confirmed with the client.
+Everything under [System Architecture](#system-architecture) onward documents
+the eventual production-grade design (Postgres, Redis, Docker, auth, model
+registry, drift detection). None of that exists yet, and it isn't being
+built until deployment scope is confirmed with the client.
 
-What's actually implemented right now, scoped to Phase 1 of
-[Development Phases](#development-phases):
+What's actually implemented right now:
 
-- `src/shipment_weight/data_gen.py` — synthetic shipment data generator (no real warehouse data received yet)
-- `src/shipment_weight/features.py` — shared feature engineering, used by both the notebook and the API
-- `src/shipment_weight/train.py` — trains linear / ridge / random forest / gradient boosted tree candidates
-- `src/shipment_weight/evaluate.py` — MAE/RMSE/bias metrics, baseline comparison, segment analysis
-- `notebooks/01_eda_and_modeling.ipynb` — EDA, model comparison, evaluation, SHAP feature importance
-- `api/main.py` — a single FastAPI `/v1/predict` endpoint with confidence band, no DB/Redis/Docker/auth
-- `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior
-- `tests/` — unit tests for data generation, feature engineering, and the API
+- `src/shipment_weight/predict.py` — **the public library entry point.** `ShipmentWeightPredictor` / `predict_shipment_weight()` take real box dimensions and raw item lines and return a weight prediction with a confidence interval.
+- `src/shipment_weight/ingest.py` — order-line aggregation and shipment feature construction, shared by training (`scripts/train_real_data.py`) and the library, so there is exactly one feature pipeline — a live prediction and a training row are computed identically.
+- `src/shipment_weight/features.py` / `features_extended.py` — feature lists, preprocessing (imputation, scaling, one-hot encoding), and experimental order-line-derived features.
+- `src/shipment_weight/data_gen.py` — synthetic shipment data generator, used for the Phase 1 synthetic pipeline and for tests (no dependency on the real Excel exports).
+- `src/shipment_weight/train.py` + `scripts/train_real_data.py` — trains and evaluates linear / ridge / random forest / gradient boosted tree / HistGBT (absolute-error loss) candidates; the shipped model is `HistGradientBoostingRegressor` (`loss="absolute_error"`), trained on real warehouse data, after a multi-library model sweep and diagnostic comparison against the previous Ridge model (archived at `models/model_ridge_v0.4.0_archived.joblib` for rollback) — see [MODEL_CARD.md](MODEL_CARD.md).
+- `notebooks/01_eda_and_modeling.ipynb` — EDA and model comparison on synthetic data (Phase 1 exploration; the real-data model selection story is in `MODEL_CARD.md`, not this notebook).
+- `api/main.py` — a secondary FastAPI `/v1/predict` endpoint, currently unmodified/unwired to the library (see that file's docstring for the known limitation).
+- `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior.
+- `tests/` — unit tests for data generation, feature engineering, and the library's prediction path.
 
 ## Quick Start
 
@@ -30,36 +31,72 @@ What's actually implemented right now, scoped to Phase 1 of
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 
-pip install -r requirements.txt
+pip install -e ".[dev]"            # library + training/notebook/test tooling
+# pip install -e ".[api]"          # add this too if you also want the FastAPI wrapper
 
-# Train (generates synthetic data, trains gradient boosted trees, saves to models/model.joblib)
-PYTHONPATH=src python -m shipment_weight.train --out models/model.joblib
-
-# Serve
-PYTHONPATH=src uvicorn api.main:app --reload
+# Train on real data (requires the Medusa Excel exports; see MODEL_CARD.md)
+python scripts/train_real_data.py \
+    --shipments order_shipments_anonymized.xlsx \
+    --lines order_lines_in_shipment_anonymized.xlsx
 
 # Test
 pytest tests/
 ```
 
-With the API running, predict a shipment containing electronics and apparel items:
+Use the library directly — this is the primary interface:
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-    "theoretical_weight_oz": 100.0,
-    "item_count": 5,
-    "total_item_volume_in3": 800.0,
-    "item_categories": "electronics,apparel",
-    "category_mode": "electronics",
-    "carton_type": "L_16x12x10",
-    "ship_method": "GROUND",
-    "packing_material": "bubble_wrap",
-    "num_missing_catalog_weights": 0,
-    "category_avg_weight_error_oz": 0.5
-  }'
+```python
+from shipment_weight.predict import ShipmentWeightPredictor, Shipment, Box, ItemLine
+
+predictor = ShipmentWeightPredictor.load()  # defaults to models/model.joblib, or set MODEL_PATH
+
+shipment = Shipment(
+    items=[
+        ItemLine(category="electronics", quantity=2, unit_weight_lbs=0.9, length_in=6, width_in=5, height_in=3),
+        ItemLine(category="apparel", quantity=1, unit_weight_lbs=0.4, length_in=10, width_in=8, height_in=2),
+    ],
+    box=Box(box_name="14x10x8", length_in=14.0, width_in=10.0, height_in=8.0, tare_weight_lbs=0.5),
+    ship_method="FedEx Ground",
+    shipment_id="SHP-20260701-001",
+)
+
+result = predictor.predict(shipment)
+print(result.predicted_weight_lbs)            # 3.119 -- precise, unrounded: use for accuracy
+                                                #          tracking, evaluation, anything statistical
+print(result.predicted_weight_lbs_for_label)   # 4.0   -- rounded UP to the next whole pound (never
+                                                #          down, never to nearest) the way a carrier
+                                                #          rounds its own measured weight before
+                                                #          billing: this is what goes on a physical
+                                                #          shipping label, not the line above
+print(result.confidence_interval_oz)           # always based on the precise prediction, never the
+                                                #          rounded label value -- rounding is a display
+                                                #          step, not a statistical one
 ```
+
+Note the input is real box dimensions and item lines, not pre-computed
+features — `predictor.predict()` runs the same feature-engineering code used
+at training time (`shipment_weight.ingest` + `shipment_weight.features`), so
+`fill_ratio`, `void_volume_in3`, and `category_avg_weight_error_oz` are
+computed from your actual shipment, not defaulted or imputed.
+
+`predicted_weight_lbs_for_label` ALWAYS rounds up to the next whole pound
+for predictions >= 1 lb (e.g. 3.12 -> 4, never down and never "nearest")
+and leaves predictions < 1 lb unrounded — verified against real data
+(carriers round their own measured weight UP before billing for the >=1lb
+case; a quarter-pound rule was tested for the <1lb case and does not hold).
+Same rounding function
+(`shipment_weight.rounding.round_to_billing_tier`) used by
+`scripts/evaluate_rounded.py` to score predictions the way a carrier would
+bill them — see [MODEL_CARD.md](MODEL_CARD.md) for that evaluation.
+
+FastAPI, if you need an HTTP interface, is optional and secondary — see
+`api/main.py`'s docstring for its current status before relying on it.
+
+**Distributing the library** (building a wheel to install elsewhere, outside
+this repo checkout) needs one extra step so the trained model actually ships
+inside it — `python scripts/package_model.py && python -m build`. See
+[CONTRIBUTING.md](CONTRIBUTING.md#packaging-building-a-distributable-wheel)
+for why this is a manual step and not an automatic build hook.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow.
 

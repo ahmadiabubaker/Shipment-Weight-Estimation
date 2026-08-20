@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shipment-weight-estimation"
+version = "0.4.0"
+description = "Predicts actual packed shipment weight from carton/order-line data, replacing theoretical-weight estimates."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "scipy>=1.12",
+    "joblib>=1.4",
+]
+
+[project.optional-dependencies]
+# FastAPI wrapper is optional and secondary -- the library (shipment_weight.predict)
+# has none of these as hard dependencies.
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+]
+# Training scripts, notebook, data audit tooling, and packaging verification
+# (tests/test_package_model.py builds a real wheel with `python -m build
+# --no-isolation`, which needs build/wheel/setuptools present in-env since
+# --no-isolation skips PEP 517's normal auto-fetch of build dependencies)
+# -- none of this is needed to install and use the library for predictions.
+dev = [
+    "openpyxl>=3.1",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "shap>=0.45",
+    "jupyter>=1.0",
+    "pytest>=8.0",
+    "build>=1.0",
+    "wheel",
+    "setuptools>=68",
+]
+# Alternative-model benchmarking only (scripts/evaluate_model_sweep.py) --
+# never imported by shipment_weight itself or the production pipeline. Kept
+# out of `dev` so installing dev tooling (tests, packaging, notebook) doesn't
+# drag in three heavy GBT libraries that only exist to benchmark against the
+# production Ridge/HistGBT models.
+experiments = [
+    "lightgbm>=4.3",
+    "xgboost>=2.0",
+    "catboost>=1.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+shipment_weight = ["models/*.joblib"]
