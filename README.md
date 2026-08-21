@@ -113,8 +113,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow.
 - [Infrastructure & DevOps](#infrastructure--devops)
 - [Monitoring & Observability](#monitoring--observability)
 - [Security](#security)
-- [Development Phases](#development-phases)
 - [Open Questions](#open-questions)
+- [Technology Stack Summary](#technology-stack-summary)
+- [What's Next](#whats-next)
 
 ---
 
@@ -1167,78 +1168,6 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 
 ---
 
-## Development Phases
-
-**Note:** Phase 1 is substantially complete, but via a different path than
-originally planned below — real-data loading, EDA, and segment analysis
-happened through `scripts/` (`audit_real_data.py`, `analyze_residuals.py`,
-etc.) and `MODEL_CARD.md` rather than a notebook, and model selection went
-well beyond the original 4 candidates (a full multi-library sweep —
-Ridge, HistGBT, LightGBM, XGBoost, CatBoost — is documented in
-`MODEL_CARD.md`'s "Model Selection" section). Checkboxes below reflect
-what actually happened, not just the original plan.
-
-### Phase 1: Foundation (Week 1-2)
-
-**Goal:** Clean data, working feature pipeline, baseline metrics.
-
-- [x] Set up project structure, pyproject.toml, linting, CI. *(pyproject.toml + pytest; no linting/CI configured)*
-- [x] Load Medusa historical data (seed script). *(via `scripts/train_real_data.py`, not a seed script)*
-- [x] Exploratory data analysis. *(via `scripts/audit_real_data.py` and `scripts/analyze_residuals.py`, not a notebook — the notebook remains Phase 1/synthetic-only)*
-- [ ] Implement `FeatureEngineer` class with unit tests. *(feature logic lives in `shipment_weight.ingest`/`features.py` instead, with tests)*
-- [x] Compute baseline metrics (theoretical weight MAE/RMSE). *(21.24 oz / 1.328 lbs MAE, −18.95 oz bias — see `MODEL_CARD.md`)*
-- [x] Train first model candidates (linear, ridge, random forest, LightGBM). *(and HistGBT, XGBoost, CatBoost, ensembles — see `MODEL_CARD.md`)*
-- [x] Evaluation with segment analysis. *(via `scripts/analyze_residuals.py` and `scripts/evaluate_histgbt_diagnostics.py`, not a notebook)*
-
-**Deliverable:** Jupyter notebooks, baseline report, trained model artifact.
-
-### Phase 2: API (Week 3-4)
-
-**Goal:** Production API serving predictions.
-
-- [ ] FastAPI application with predict endpoint.
-- [ ] Pydantic request/response schemas.
-- [ ] Model loading at startup.
-- [ ] Feedback endpoint.
-- [ ] Health and readiness endpoints.
-- [ ] Docker + docker-compose for local dev.
-- [ ] PostgreSQL schema + Alembic migrations.
-- [ ] Unit and integration tests.
-
-**Deliverable:** Running API, Docker stack, test suite.
-
-### Phase 3: Production Hardening (Week 5-6)
-
-**Goal:** Production-ready with monitoring and CI/CD.
-
-- [ ] API key authentication and rate limiting.
-- [ ] Structured logging (JSON).
-- [ ] Redis caching for prediction dedup.
-- [ ] Model registry (DB-backed).
-- [ ] Batch prediction endpoint.
-- [ ] CI/CD pipeline (GitHub Actions).
-- [ ] Load testing (benchmark script).
-- [ ] Error handling and edge cases.
-
-**Deliverable:** Production-ready system, CI/CD pipeline, load test results.
-
-### Phase 4: ML Operations (Week 7-8)
-
-**Goal:** Automated retraining and monitoring.
-
-- [x] Training pipeline as CLI command. *(`scripts/train_real_data.py`)*
-- [ ] Model comparison and promotion workflow. *(model comparison exists via `scripts/evaluate_model_sweep.py`; promotion is still a manual code change, not a workflow)*
-- [ ] Drift detection (PSI on features).
-- [ ] Production metrics dashboard.
-- [ ] Alerting rules.
-- [x] Confidence intervals on predictions. *(`WeightPrediction.confidence_interval_oz`, Gaussian ~90% interval — see `MODEL_CARD.md`'s "Confidence Intervals" section for its known limitations)*
-- [x] Historical feature lookup (avg SKU error, carton error). *(`category_avg_weight_error_oz`, train-fold target encoding baked into the model bundle)*
-- [ ] Documentation. *(README/MODEL_CARD/CONTRIBUTING exist; no docs site)*
-
-**Deliverable:** Full MLOps loop, monitoring dashboards, documentation.
-
----
-
 ## Open Questions
 
 These need answers before or during development:
@@ -1279,3 +1208,13 @@ These need answers before or during development:
 | Type Checking | mypy | Latest |
 | Testing | pytest | Latest |
 | Load Testing | locust or custom | Latest |
+
+---
+
+## What's Next
+
+- Bring `api/main.py` up to parity with the library (raw box dims/item lines, the `predicted_weight_lbs_for_label` rounding field) or retire it.
+- Fix the missing box-tare-weight data gap — a validated ~40% baseline-error reduction, not yet implemented (see `MODEL_CARD.md`).
+- Catalog-weight review for the 30x20x12 box — the largest remaining error source, likely a data problem rather than a model problem.
+- Production infrastructure (auth, database, monitoring, CI/CD) — none of it exists yet; scoped in [System Architecture](#system-architecture) above but not built.
+- Deployment decisions still open — WMS integration, per-warehouse vs. global model, expected request volume (see [Open Questions](#open-questions)).
