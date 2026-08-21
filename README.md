@@ -1289,71 +1289,6 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 
 ---
 
-## Development Phases
-
-### Scope Philosophy
-
-Depth beats surface area. A system where predict, feedback, retrain, drift detection, and the model registry genuinely work end to end — with point-in-time features handled correctly — is more defensible and more useful than a broader system where half the subsystems are stubs. The phases below reflect what gets built; the rest of this README is the documented roadmap for what comes next.
-
-### Phase 1: Data & ML Foundation (Week 1-2)
-
-**Goal:** Clean data, correct feature pipeline, residual-target baseline.
-
-- [ ] Set up project structure, pyproject.toml, linting, CI.
-- [ ] Load Medusa historical data (seed script).
-- [ ] Exploratory data analysis notebook.
-- [ ] Implement `FeatureEngineer` with point-in-time historical features and unit tests.
-- [ ] Compute baseline metrics (zero-adjustment = theoretical weight MAE/RMSE).
-- [ ] Train residual-target models (linear, ridge, random forest, LightGBM).
-- [ ] Conformal prediction intervals via MAPIE.
-- [ ] Evaluation notebook with segment analysis and error deep-dives.
-
-**Deliverable:** Notebooks, baseline report, trained model artifact, evaluation summary.
-
-### Phase 2: API & Feedback Loop (Week 3-4)
-
-**Goal:** Working API with the full predict → feedback → retrain loop.
-
-- [ ] FastAPI application with `/predict` and `/feedback` endpoints.
-- [ ] Pydantic request/response schemas (residual-based response).
-- [ ] Model loading at startup from local filesystem.
-- [ ] Health and readiness endpoints.
-- [ ] PostgreSQL schema + Alembic migrations.
-- [ ] Redis-backed historical feature cache (background refresh task).
-- [ ] Docker + docker-compose for local dev (API + Postgres + Redis).
-- [ ] Unit and integration tests.
-
-**Deliverable:** Running API, Docker stack, test suite, feedback loop working.
-
-### Phase 3: Model Operations (Week 5-6)
-
-**Goal:** Retraining, model registry, drift detection — the pieces that make this production-grade.
-
-- [ ] Model registry (DB-backed, with promotion workflow).
-- [ ] Training pipeline as CLI command (`make train VERSION=v1.1.0`).
-- [ ] Model comparison: challenger vs champion on holdout data.
-- [ ] Drift detection (PSI on features, rolling MAE monitoring).
-- [ ] API key authentication and rate limiting (Redis-backed).
-- [ ] Structured JSON logging with request correlation.
-- [ ] CI pipeline (GitHub Actions: lint + test + build).
-- [ ] Error handling and edge cases.
-
-**Deliverable:** Production-ready system with retraining loop and monitoring.
-
-### Roadmap (Not Built in V1)
-
-These are documented in this design but deferred until the core is solid:
-
-- Batch prediction endpoint (`/v1/batch-predict`)
-- Cloud deployment (Terraform, ECS/Cloud Run, RDS, ElastiCache)
-- Deploy and retrain CI/CD workflows
-- Production dashboards (Grafana/CloudWatch)
-- Alerting rules
-- Multi-warehouse model training
-- Load testing / benchmarking
-
----
-
 ## Open Questions
 
 These need answers before or during development:
@@ -1394,3 +1329,13 @@ These need answers before or during development:
 | Type Checking | mypy | Latest |
 | Testing | pytest | Latest |
 | Confidence Intervals | MAPIE (conformal prediction) | Latest |
+
+---
+
+## What's Next
+
+- Bring `api/main.py` up to parity with the library (raw box dims/item lines, the `predicted_weight_lbs_for_label` rounding field) or retire it.
+- Fix the missing box-tare-weight data gap — a validated ~6% further error reduction on the production model seen in early testing, not yet production-validated (see `MODEL_CARD.md`).
+- Catalog-weight review for the 30x20x12 box — the largest remaining error source, likely a data problem rather than a model problem.
+- Production infrastructure (auth, database, monitoring, CI/CD, drift detection, model registry) — none of it exists yet; scoped in [System Architecture](#system-architecture) above but not built.
+- Deployment decisions still open — WMS integration, per-warehouse vs. global model, expected request volume (see [Open Questions](#open-questions)).
