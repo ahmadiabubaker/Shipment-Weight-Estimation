@@ -2,6 +2,8 @@
 
 > A Python library that predicts the actual packed weight of warehouse shipments from real box dimensions and order-line data, replacing inaccurate theoretical weight calculations with a data-driven correction.
 
+**Author:** Hanumath Mandadi
+
 **Status:** Phase 1 implementation in progress. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
 
 ---
@@ -1167,17 +1169,26 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 
 ## Development Phases
 
+**Note:** Phase 1 is substantially complete, but via a different path than
+originally planned below — real-data loading, EDA, and segment analysis
+happened through `scripts/` (`audit_real_data.py`, `analyze_residuals.py`,
+etc.) and `MODEL_CARD.md` rather than a notebook, and model selection went
+well beyond the original 4 candidates (a full multi-library sweep —
+Ridge, HistGBT, LightGBM, XGBoost, CatBoost — is documented in
+`MODEL_CARD.md`'s "Model Selection" section). Checkboxes below reflect
+what actually happened, not just the original plan.
+
 ### Phase 1: Foundation (Week 1-2)
 
 **Goal:** Clean data, working feature pipeline, baseline metrics.
 
-- [ ] Set up project structure, pyproject.toml, linting, CI.
-- [ ] Load Medusa historical data (seed script).
-- [ ] Exploratory data analysis notebook.
-- [ ] Implement `FeatureEngineer` class with unit tests.
-- [ ] Compute baseline metrics (theoretical weight MAE/RMSE).
-- [ ] Train first model candidates (linear, ridge, random forest, LightGBM).
-- [ ] Evaluation notebook with segment analysis.
+- [x] Set up project structure, pyproject.toml, linting, CI. *(pyproject.toml + pytest; no linting/CI configured)*
+- [x] Load Medusa historical data (seed script). *(via `scripts/train_real_data.py`, not a seed script)*
+- [x] Exploratory data analysis. *(via `scripts/audit_real_data.py` and `scripts/analyze_residuals.py`, not a notebook — the notebook remains Phase 1/synthetic-only)*
+- [ ] Implement `FeatureEngineer` class with unit tests. *(feature logic lives in `shipment_weight.ingest`/`features.py` instead, with tests)*
+- [x] Compute baseline metrics (theoretical weight MAE/RMSE). *(21.24 oz / 1.328 lbs MAE, −18.95 oz bias — see `MODEL_CARD.md`)*
+- [x] Train first model candidates (linear, ridge, random forest, LightGBM). *(and HistGBT, XGBoost, CatBoost, ensembles — see `MODEL_CARD.md`)*
+- [x] Evaluation with segment analysis. *(via `scripts/analyze_residuals.py` and `scripts/evaluate_histgbt_diagnostics.py`, not a notebook)*
 
 **Deliverable:** Jupyter notebooks, baseline report, trained model artifact.
 
@@ -1215,14 +1226,14 @@ PSI > 0.2  → Significant drift (red, trigger retrain)
 
 **Goal:** Automated retraining and monitoring.
 
-- [ ] Training pipeline as CLI command.
-- [ ] Model comparison and promotion workflow.
+- [x] Training pipeline as CLI command. *(`scripts/train_real_data.py`)*
+- [ ] Model comparison and promotion workflow. *(model comparison exists via `scripts/evaluate_model_sweep.py`; promotion is still a manual code change, not a workflow)*
 - [ ] Drift detection (PSI on features).
 - [ ] Production metrics dashboard.
 - [ ] Alerting rules.
-- [ ] Confidence intervals on predictions.
-- [ ] Historical feature lookup (avg SKU error, carton error).
-- [ ] Documentation.
+- [x] Confidence intervals on predictions. *(`WeightPrediction.confidence_interval_oz`, Gaussian ~90% interval — see `MODEL_CARD.md`'s "Confidence Intervals" section for its known limitations)*
+- [x] Historical feature lookup (avg SKU error, carton error). *(`category_avg_weight_error_oz`, train-fold target encoding baked into the model bundle)*
+- [ ] Documentation. *(README/MODEL_CARD/CONTRIBUTING exist; no docs site)*
 
 **Deliverable:** Full MLOps loop, monitoring dashboards, documentation.
 
@@ -1234,10 +1245,10 @@ These need answers before or during development:
 
 | # | Question | Impact | Status |
 |---|---|---|---|
-| 1 | What format is Medusa's historical data? (CSV, DB export, API?) | Determines data loading approach | Open |
-| 2 | How many historical shipments are available? | Affects model choice and evaluation strategy | Open |
-| 3 | What fields are in the historical data? | Determines which features are actually buildable | Open |
-| 4 | Does Medusa already track actual packed weight digitally? | Determines if feedback loop is automatic or manual | Open |
+| 1 | What format is Medusa's historical data? (CSV, DB export, API?) | Determines data loading approach | **Answered** — two Excel exports (`order_shipments_anonymized.xlsx`, `order_lines_in_shipment_anonymized.xlsx`) |
+| 2 | How many historical shipments are available? | Affects model choice and evaluation strategy | **Answered** — 66,224 raw rows (Jan–Jun 2026), 58,822 after cleaning; see `MODEL_CARD.md` |
+| 3 | What fields are in the historical data? | Determines which features are actually buildable | **Answered** — see `shipment_weight.ingest`/`features.py` and `MODEL_CARD.md`'s Features table |
+| 4 | Does Medusa already track actual packed weight digitally? | Determines if feedback loop is automatic or manual | **Answered** — yes, `actual_weight_lbs` per shipment (that's the model's training target) |
 | 5 | What WMS does Medusa use? | Determines integration approach | Open |
 | 6 | How will this API be called — from Perseuss cartonization, from the WMS, or both? | Determines auth model and deployment topology | Open |
 | 7 | What's the expected request volume? (per day, peak per minute) | Determines infrastructure sizing | Open |
