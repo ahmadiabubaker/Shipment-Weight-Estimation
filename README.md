@@ -2,7 +2,9 @@
 
 > A Python library that predicts the actual packed weight of warehouse shipments from real box dimensions and order-line data, replacing inaccurate theoretical weight calculations with a data-driven correction.
 
-**Status:** Phase 1 implementation in progress. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
+**Author:** Hanumath Mandadi
+
+**Status:** Core library and production model are complete and in use; see [What's Next](#whats-next) for what's still open. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
 
 ---
 
@@ -18,9 +20,9 @@ What's actually implemented right now:
 - `src/shipment_weight/predict.py` — **the public library entry point.** `ShipmentWeightPredictor` / `predict_shipment_weight()` take real box dimensions and raw item lines and return a weight prediction with a confidence interval.
 - `src/shipment_weight/ingest.py` — order-line aggregation and shipment feature construction, shared by training (`scripts/train_real_data.py`) and the library, so there is exactly one feature pipeline — a live prediction and a training row are computed identically.
 - `src/shipment_weight/features.py` / `features_extended.py` — feature lists, preprocessing (imputation, scaling, one-hot encoding), and experimental order-line-derived features.
-- `src/shipment_weight/data_gen.py` — synthetic shipment data generator, used for the Phase 1 synthetic pipeline and for tests (no dependency on the real Excel exports).
+- `src/shipment_weight/data_gen.py` — synthetic shipment data generator, used for the early synthetic-data pipeline and for tests (no dependency on the real Excel exports).
 - `src/shipment_weight/train.py` + `scripts/train_real_data.py` — trains and evaluates linear / ridge / random forest / gradient boosted tree / HistGBT (absolute-error loss) candidates; the shipped model is `HistGradientBoostingRegressor` (`loss="absolute_error"`), trained on real warehouse data, after a multi-library model sweep and diagnostic comparison against the previous Ridge model (archived at `models/model_ridge_v0.4.0_archived.joblib` for rollback) — see [MODEL_CARD.md](MODEL_CARD.md).
-- `notebooks/01_eda_and_modeling.ipynb` — EDA and model comparison on synthetic data (Phase 1 exploration; the real-data model selection story is in `MODEL_CARD.md`, not this notebook).
+- `notebooks/01_eda_and_modeling.ipynb` — EDA and model comparison on synthetic data (early exploration, before real data existed; the real-data model selection story is in `MODEL_CARD.md`, not this notebook).
 - `api/main.py` — a secondary FastAPI `/v1/predict` endpoint, currently unmodified/unwired to the library (see that file's docstring for the known limitation).
 - `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior.
 - `tests/` — unit tests for data generation, feature engineering, and the library's prediction path.
@@ -111,8 +113,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow.
 - [Infrastructure & DevOps](#infrastructure--devops)
 - [Monitoring & Observability](#monitoring--observability)
 - [Security](#security)
-- [Development Phases](#development-phases)
 - [Open Questions](#open-questions)
+- [Technology Stack Summary](#technology-stack-summary)
+- [What's Next](#whats-next)
 
 ---
 
@@ -1357,10 +1360,10 @@ These need answers before or during development:
 
 | # | Question | Impact | Status |
 |---|---|---|---|
-| 1 | What format is Medusa's historical data? (CSV, DB export, API?) | Determines data loading approach | Open |
-| 2 | How many historical shipments are available? | Affects model choice and evaluation strategy | Open |
-| 3 | What fields are in the historical data? | Determines which features are actually buildable | Open |
-| 4 | Does Medusa already track actual packed weight digitally? | Determines if feedback loop is automatic or manual | Open |
+| 1 | What format is Medusa's historical data? (CSV, DB export, API?) | Determines data loading approach | **Answered** — two Excel exports (`order_shipments_anonymized.xlsx`, `order_lines_in_shipment_anonymized.xlsx`) |
+| 2 | How many historical shipments are available? | Affects model choice and evaluation strategy | **Answered** — 66,224 raw rows (Jan–Jun 2026), 58,822 after cleaning; see `MODEL_CARD.md` |
+| 3 | What fields are in the historical data? | Determines which features are actually buildable | **Answered** — see `shipment_weight.ingest`/`features.py` and `MODEL_CARD.md`'s Features table |
+| 4 | Does Medusa already track actual packed weight digitally? | Determines if feedback loop is automatic or manual | **Answered** — yes, `actual_weight_lbs` per shipment (that's the model's training target) |
 | 5 | What WMS does Medusa use? | Determines integration approach | Open |
 | 6 | How will this API be called — from Perseuss cartonization, from the WMS, or both? | Determines auth model and deployment topology | Open |
 | 7 | What's the expected request volume? (per day, peak per minute) | Determines infrastructure sizing | Open |
