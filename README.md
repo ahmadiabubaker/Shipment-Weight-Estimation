@@ -4,7 +4,7 @@
 
 **Author:** Hanumath Mandadi
 
-**Status:** Phase 1 implementation in progress. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
+**Status:** Core library and production model are complete and in use; see [What's Next](#whats-next) for what's still open. **Primary deliverable is the `shipment_weight` library** (`pip install -e .`, `import shipment_weight`); FastAPI is an optional, secondary interface, not required to use the model.
 
 ---
 
@@ -20,9 +20,9 @@ What's actually implemented right now:
 - `src/shipment_weight/predict.py` — **the public library entry point.** `ShipmentWeightPredictor` / `predict_shipment_weight()` take real box dimensions and raw item lines and return a weight prediction with a confidence interval.
 - `src/shipment_weight/ingest.py` — order-line aggregation and shipment feature construction, shared by training (`scripts/train_real_data.py`) and the library, so there is exactly one feature pipeline — a live prediction and a training row are computed identically.
 - `src/shipment_weight/features.py` / `features_extended.py` — feature lists, preprocessing (imputation, scaling, one-hot encoding), and experimental order-line-derived features.
-- `src/shipment_weight/data_gen.py` — synthetic shipment data generator, used for the Phase 1 synthetic pipeline and for tests (no dependency on the real Excel exports).
+- `src/shipment_weight/data_gen.py` — synthetic shipment data generator, used for the early synthetic-data pipeline and for tests (no dependency on the real Excel exports).
 - `src/shipment_weight/train.py` + `scripts/train_real_data.py` — trains and evaluates linear / ridge / random forest / gradient boosted tree / HistGBT (absolute-error loss) candidates; the shipped model is `HistGradientBoostingRegressor` (`loss="absolute_error"`), trained on real warehouse data, after a multi-library model sweep and diagnostic comparison against the previous Ridge model (archived at `models/model_ridge_v0.4.0_archived.joblib` for rollback) — see [MODEL_CARD.md](MODEL_CARD.md).
-- `notebooks/01_eda_and_modeling.ipynb` — EDA and model comparison on synthetic data (Phase 1 exploration; the real-data model selection story is in `MODEL_CARD.md`, not this notebook).
+- `notebooks/01_eda_and_modeling.ipynb` — EDA and model comparison on synthetic data (early exploration, before real data existed; the real-data model selection story is in `MODEL_CARD.md`, not this notebook).
 - `api/main.py` — a secondary FastAPI `/v1/predict` endpoint, currently unmodified/unwired to the library (see that file's docstring for the known limitation).
 - `MODEL_CARD.md` — training data assumptions, known failure modes, OOD behavior.
 - `tests/` — unit tests for data generation, feature engineering, and the library's prediction path.
@@ -907,7 +907,7 @@ shipment-weight-estimation/
 │   │       ├── ci.yml              # Lint + test + build on PR
 │   │       ├── deploy.yml          # Build + push + deploy on merge to main
 │   │       └── train.yml           # Weekly retraining pipeline
-│   └── terraform/                  # Cloud infra (Phase 3)
+│   └── terraform/                  # Cloud infra (future)
 │       ├── main.tf
 │       ├── variables.tf
 │       └── outputs.tf
